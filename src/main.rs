@@ -1,7 +1,9 @@
+use eframe::egui;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::fs::OpenOptionsExt;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
@@ -12,6 +14,8 @@ struct FileEntry {
     parent_ref: u64,
     is_directory: bool,
     full_path: Option<String>,
+    extension: String,
+    size: u64,
 }
 
 struct MftReader {
@@ -20,14 +24,14 @@ struct MftReader {
 }
 
 impl MftReader {
-    fn new(drive_letter: char) -> io::Result<Self> {
-        Ok(Self {
+    fn new(drive_letter: char) -> Self {
+        Self {
             entries: HashMap::new(),
             drive_letter,
-        })
+        }
     }
 
-    fn read_mft(&mut self) -> io::Result<()> {
+    fn read_mft(&mut self) -> std::io::Result<()> {
         let mft_path = format!("\\\\.\\{}:", self.drive_letter);
         
         let mut file = std::fs::OpenOptions::new()
@@ -35,7 +39,6 @@ impl MftReader {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&mft_path)?;
 
-        // Read MFT location from boot sector
         let mut boot_sector = vec![0u8; 512];
         file.read_exact(&mut boot_sector)?;
 
@@ -50,23 +53,15 @@ impl MftReader {
 
         let mft_offset = mft_cluster * bytes_per_cluster;
         
-        // Read the MFT's own entry (entry 0) to get the full MFT size
         file.seek(SeekFrom::Start(mft_offset))?;
         let mut mft_entry = vec![0u8; 1024];
         file.read_exact(&mut mft_entry)?;
 
-        // Parse entry 0 to get MFT size
         let mft_size = self.get_mft_size(&mft_entry)?;
         let entry_size = 1024u64;
         let total_entries = mft_size / entry_size;
 
-        println!("MFT size: {} bytes", mft_size);
-        println!("Total MFT entries: {}", total_entries);
-        println!("Reading entries...");
-
-        // Read all MFT entries
-        let mut buffer = vec![0u8; (entry_size * 100) as usize]; // Read 100 entries at a time
-        let mut entries_read = 0;
+        let mut buffer = vec![0u8; (entry_size * 100) as usize];
 
         for chunk_start in (0..total_entries).step_by(100) {
             let entries_in_chunk = std::cmp::min(100, total_entries - chunk_start);
@@ -88,27 +83,16 @@ impl MftReader {
                     self.entries.insert(entry_num, file_entry);
                 }
             }
-
-            entries_read += entries_in_chunk;
-            if entries_read % 10000 == 0 {
-                print!("\rRead {} entries...", entries_read);
-                io::stdout().flush()?;
-            }
         }
 
-        println!("\rRead {} entries total", entries_read);
-        println!("Building file paths...");
-
-        // Build full paths
         self.build_paths();
         
         Ok(())
     }
 
-    fn get_mft_size(&self, mft_entry: &[u8]) -> io::Result<u64> {
-        // Check FILE signature
+    fn get_mft_size(&self, mft_entry: &[u8]) -> std::io::Result<u64> {
         if &mft_entry[0..4] != b"FILE" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid MFT entry"));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid MFT entry"));
         }
 
         let first_attr_offset = u16::from_le_bytes([mft_entry[20], mft_entry[21]]) as usize;
@@ -133,12 +117,10 @@ impl MftReader {
                 break;
             }
 
-            // 0x80 = DATA attribute
             if attr_type == 0x80 {
                 let non_resident_flag = mft_entry[offset + 8];
                 
                 if non_resident_flag != 0 {
-                    // Non-resident - read allocated size
                     if offset + 40 <= mft_entry.len() {
                         let allocated_size = u64::from_le_bytes([
                             mft_entry[offset + 40], mft_entry[offset + 41],
@@ -154,17 +136,14 @@ impl MftReader {
             offset += attr_length;
         }
 
-        // Default fallback
-        Ok(1024 * 100000) // 100k entries as fallback
+        Ok(1024 * 100000)
     }
 
-    fn parse_mft_entry(&self, data: &[u8], entry_num: u64) -> Option<FileEntry> {
-        // Check FILE signature
+    fn parse_mft_entry(&self, data: &[u8], _entry_num: u64) -> Option<FileEntry> {
         if data.len() < 4 || &data[0..4] != b"FILE" {
             return None;
         }
 
-        // Check if entry is in use (bit 0 of flags at offset 22)
         if data.len() < 23 || (data[22] & 0x01) == 0 {
             return None;
         }
@@ -172,8 +151,8 @@ impl MftReader {
         let mut best_name = String::new();
         let mut parent_ref = 0u64;
         let mut is_directory = false;
+        let mut size = 0u64;
 
-        // Parse attributes starting at offset 20 (first attribute offset)
         let first_attr_offset = u16::from_le_bytes([data[20], data[21]]) as usize;
         let mut offset = first_attr_offset;
 
@@ -182,7 +161,6 @@ impl MftReader {
                 data[offset], data[offset + 1], data[offset + 2], data[offset + 3]
             ]);
             
-            // 0xFFFFFFFF marks end of attributes
             if attr_type == 0xFFFFFFFF {
                 break;
             }
@@ -195,18 +173,31 @@ impl MftReader {
                 break;
             }
 
-            // 0x30 = FILE_NAME attribute
             if attr_type == 0x30 {
                 if let Some((name, parent, is_dir, namespace)) = 
                     self.parse_filename_attribute(&data[offset..offset + attr_length]) {
                     
-                    // Prefer Win32 or Win32+DOS names over DOS-only or POSIX names
-                    // Namespace: 0=POSIX, 1=Win32, 2=DOS, 3=Win32+DOS
                     if best_name.is_empty() || namespace == 1 || namespace == 3 {
                         best_name = name;
                         parent_ref = parent;
                         is_directory = is_dir;
                     }
+                }
+            } else if attr_type == 0x80 {
+                let non_resident_flag = data[offset + 8];
+                if non_resident_flag == 0 && offset + 24 <= data.len() {
+                    let content_length = u32::from_le_bytes([
+                        data[offset + 16], data[offset + 17],
+                        data[offset + 18], data[offset + 19]
+                    ]) as u64;
+                    size = content_length;
+                } else if non_resident_flag != 0 && offset + 48 <= data.len() {
+                    size = u64::from_le_bytes([
+                        data[offset + 48], data[offset + 49],
+                        data[offset + 50], data[offset + 51],
+                        data[offset + 52], data[offset + 53],
+                        data[offset + 54], data[offset + 55],
+                    ]);
                 }
             }
 
@@ -214,11 +205,19 @@ impl MftReader {
         }
 
         if !best_name.is_empty() && !best_name.contains('\0') {
+            let extension = if let Some(pos) = best_name.rfind('.') {
+                best_name[pos..].to_uppercase()
+            } else {
+                String::new()
+            };
+
             Some(FileEntry {
                 name: best_name,
                 parent_ref,
                 is_directory,
                 full_path: None,
+                extension,
+                size,
             })
         } else {
             None
@@ -230,13 +229,11 @@ impl MftReader {
             return None;
         }
 
-        // Non-resident flag at offset 8
         let non_resident = attr_data[8];
         if non_resident != 0 {
-            return None; // Filename attributes are always resident
+            return None;
         }
 
-        // Content offset at offset 20 (for resident attributes)
         let content_offset = u16::from_le_bytes([attr_data[20], attr_data[21]]) as usize;
         
         if content_offset + 66 > attr_data.len() {
@@ -245,13 +242,11 @@ impl MftReader {
 
         let content = &attr_data[content_offset..];
 
-        // Parent directory reference (first 6 bytes at offset 0)
         let parent_ref = u64::from_le_bytes([
             content[0], content[1], content[2], content[3],
             content[4], content[5], 0, 0
         ]) & 0x0000FFFFFFFFFFFF;
 
-        // File flags at offset 56
         if content_offset + 60 > attr_data.len() {
             return None;
         }
@@ -260,16 +255,12 @@ impl MftReader {
         ]);
         let is_directory = (flags & 0x10000000) != 0;
 
-        // Filename length (in characters, not bytes) at offset 64
         if content_offset + 65 > attr_data.len() {
             return None;
         }
         let name_length = content[64] as usize;
-        
-        // Namespace at offset 65
         let namespace = content[65];
 
-        // Filename starts at offset 66, UTF-16 LE
         let name_start = 66;
         let name_end = name_start + (name_length * 2);
         
@@ -277,7 +268,6 @@ impl MftReader {
             return None;
         }
 
-        // Parse UTF-16 LE
         let mut name_u16 = Vec::with_capacity(name_length);
         for i in 0..name_length {
             let byte_offset = name_start + (i * 2);
@@ -309,7 +299,6 @@ impl MftReader {
 
     fn build_full_path(&self, entry_ref: u64, entry: &FileEntry) -> String {
         if entry.parent_ref == 5 || entry.parent_ref == entry_ref {
-            // Root directory
             return format!("{}:\\{}", self.drive_letter, entry.name);
         }
 
@@ -318,10 +307,9 @@ impl MftReader {
         let mut seen = std::collections::HashSet::new();
         seen.insert(entry_ref);
 
-        // Traverse up to root (with cycle detection)
         for _ in 0..100 {
             if seen.contains(&current_ref) {
-                break; // Cycle detected
+                break;
             }
             seen.insert(current_ref);
 
@@ -339,118 +327,227 @@ impl MftReader {
         path_parts.reverse();
         format!("{}:\\{}", self.drive_letter, path_parts.join("\\"))
     }
+}
 
-    fn search(&self, query: &str, folder_filter: Option<&str>, ext_filter: Option<&str>) -> Vec<String> {
-        let query_lower = query.to_lowercase();
-        let mut results = Vec::new();
+struct SearchApp {
+    mft_data: Arc<Mutex<Option<MftReader>>>,
+    search_query: String,
+    filtered_results: Vec<FileEntry>,
+    loading: bool,
+    status_message: String,
+    scroll_offset: f32,
+}
 
-        for entry in self.entries.values() {
-            if let Some(full_path) = &entry.full_path {
-                let name_lower = entry.name.to_lowercase();
-                
-                // Check if name matches query
-                if !name_lower.contains(&query_lower) {
-                    continue;
+impl SearchApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let app = Self {
+            mft_data: Arc::new(Mutex::new(None)),
+            search_query: String::new(),
+            filtered_results: Vec::new(),
+            loading: true,
+            status_message: "Indexing drive C:...".to_string(),
+            scroll_offset: 0.0,
+        };
+
+        let mft_data = app.mft_data.clone();
+        let ctx = cc.egui_ctx.clone();
+        
+        thread::spawn(move || {
+            let mut reader = MftReader::new('C');
+            match reader.read_mft() {
+                Ok(_) => {
+                    // don't create an unused variable
+                    let _count = reader.entries.len();
+                    *mft_data.lock().unwrap() = Some(reader);
+                    ctx.request_repaint();
                 }
-
-                // Check folder filter
-                if let Some(folder) = folder_filter {
-                    let folder_norm = folder.to_lowercase().replace('/', "\\");
-                    let path_lower = full_path.to_lowercase();
-                    if !path_lower.starts_with(&folder_norm) {
-                        continue;
-                    }
+                Err(e) => {
+                    eprintln!("Error reading MFT: {}", e);
                 }
-
-                // Check extension filter
-                if let Some(ext) = ext_filter {
-                    let ext_with_dot = if ext.starts_with('.') {
-                        ext.to_lowercase()
-                    } else {
-                        format!(".{}", ext.to_lowercase())
-                    };
-                    
-                    if !name_lower.ends_with(&ext_with_dot) {
-                        continue;
-                    }
-                }
-
-                results.push(full_path.clone());
             }
-        }
+        });
 
-        results.sort();
-        results
+        app
+    }
+
+    fn update_search(&mut self) {
+        if let Some(reader) = self.mft_data.lock().unwrap().as_ref() {
+            let query_lower = self.search_query.to_lowercase();
+            
+            self.filtered_results.clear();
+            
+            for entry in reader.entries.values() {
+                if let Some(full_path) = &entry.full_path {
+                    let name_lower = entry.name.to_lowercase();
+                    
+                    if query_lower.is_empty() || name_lower.contains(&query_lower) {
+                        self.filtered_results.push(entry.clone());
+                    }
+                }
+            }
+            
+            self.filtered_results.sort_by(|a, b| {
+                a.full_path.as_ref().unwrap().to_lowercase()
+                    .cmp(&b.full_path.as_ref().unwrap().to_lowercase())
+            });
+
+            self.status_message = format!("{} objects", self.filtered_results.len());
+        }
+    }
+
+    fn format_size(size: u64) -> String {
+        if size == 0 {
+            return String::new();
+        }
+        
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+        
+        if size >= GB {
+            format!("{:.1} GB", size as f64 / GB as f64)
+        } else if size >= MB {
+            format!("{:.1} MB", size as f64 / MB as f64)
+        } else if size >= KB {
+            format!("{} KB", size / KB)
+        } else {
+            format!("{} bytes", size)
+        }
     }
 }
 
-fn main() -> io::Result<()> {
-    println!("MFT File Search Tool");
-    println!("===================");
-    println!("Note: This program requires Administrator privileges to read the MFT.\n");
+impl eframe::App for SearchApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.loading {
+            // Check for presence of data while ensuring the mutex guard is dropped
+            let has_data = { self.mft_data.lock().unwrap().is_some() };
+            if has_data {
+                self.loading = false;
+                self.update_search();
+            }
+        }
 
-    print!("Enter drive letter to index (e.g., C): ");
-    io::stdout().flush()?;
-    let mut drive_input = String::new();
-    io::stdin().read_line(&mut drive_input)?;
-    let drive_letter = drive_input.trim().chars().next()
-        .unwrap_or('C')
-        .to_ascii_uppercase();
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Exit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Edit", |_ui| {});
+                ui.menu_button("View", |_ui| {});
+                ui.menu_button("Search", |_ui| {});
+                ui.menu_button("Bookmarks", |_ui| {});
+                ui.menu_button("Tools", |_ui| {});
+                ui.menu_button("Help", |_ui| {});
+            });
+        });
 
-    println!("\nIndexing drive {}:...", drive_letter);
-    let mut reader = MftReader::new(drive_letter)?;
+        egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.label("Search:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .desired_width(ui.available_width() - 8.0)
+                );
+                
+                if response.changed() {
+                    self.update_search();
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.label(&self.status_message);
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.loading {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(100.0);
+                    ui.spinner();
+                    ui.label("Indexing MFT...");
+                });
+                return;
+            }
+
+            use egui_extras::{Column, TableBuilder};
+            
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(300.0))
+                .column(Column::auto().at_least(400.0))
+                .column(Column::auto().at_least(60.0))
+                .column(Column::auto().at_least(60.0))
+                .header(20.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("Name");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Path");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Size");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Extension");
+                    });
+                })
+                .body(|body| {
+                    body.rows(18.0, self.filtered_results.len(), |mut row| {
+                        let index = row.index();
+                        if let Some(entry) = self.filtered_results.get(index) {
+                            row.col(|ui| {
+                                ui.label(&entry.name);
+                            });
+                            row.col(|ui| {
+                                if let Some(path) = &entry.full_path {
+                                    let parent_path = if let Some(pos) = path.rfind('\\') {
+                                        &path[..pos]
+                                    } else {
+                                        path
+                                    };
+                                    ui.label(parent_path);
+                                }
+                            });
+                            row.col(|ui| {
+                                if !entry.is_directory {
+                                    ui.label(Self::format_size(entry.size));
+                                }
+                            });
+                            row.col(|ui| {
+                                if !entry.extension.is_empty() {
+                                    ui.label(&entry.extension);
+                                }
+                            });
+                        }
+                    });
+                });
+        });
+
+        ctx.request_repaint();
+    }
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 700.0])
+            .with_title("MFT Search"),
+        ..Default::default()
+    };
     
-    match reader.read_mft() {
-        Ok(_) => {
-            println!("Successfully indexed {} files/folders\n", reader.entries.len());
-        }
-        Err(e) => {
-            eprintln!("Error reading MFT: {}", e);
-            eprintln!("Make sure you're running as Administrator!");
-            return Err(e);
-        }
-    }
-
-    loop {
-        print!("\nEnter search query (or 'quit' to exit): ");
-        io::stdout().flush()?;
-        let mut query = String::new();
-        io::stdin().read_line(&mut query)?;
-        let query = query.trim();
-
-        if query.eq_ignore_ascii_case("quit") {
-            break;
-        }
-
-        if query.is_empty() {
-            continue;
-        }
-
-        print!("Filter by folder (optional, press Enter to skip): ");
-        io::stdout().flush()?;
-        let mut folder_filter = String::new();
-        io::stdin().read_line(&mut folder_filter)?;
-        let folder_filter = folder_filter.trim();
-        let folder_opt = if folder_filter.is_empty() { None } else { Some(folder_filter) };
-
-        print!("Filter by extension (optional, e.g., 'txt' or '.txt'): ");
-        io::stdout().flush()?;
-        let mut ext_filter = String::new();
-        io::stdin().read_line(&mut ext_filter)?;
-        let ext_filter = ext_filter.trim();
-        let ext_opt = if ext_filter.is_empty() { None } else { Some(ext_filter) };
-
-        let results = reader.search(query, folder_opt, ext_opt);
-        
-        println!("\nFound {} results:", results.len());
-        for (i, result) in results.iter().take(100).enumerate() {
-            println!("{}: {}", i + 1, result);
-        }
-        
-        if results.len() > 100 {
-            println!("... and {} more results (showing first 100)", results.len() - 100);
-        }
-    }
-
-    Ok(())
+    eframe::run_native(
+        "MFT Search",
+        options,
+        Box::new(|cc| Ok(Box::new(SearchApp::new(cc)))),
+    )
 }
