@@ -115,3 +115,13 @@ When launched the app will start indexing the MFT for drive C: by default. The U
 ## License
 
 This repository includes a LICENSE file. See LICENSE for details.
+
+## Todo
+
+No real-time updates (would need USN journal monitoring)
+Regex support
+Size/date filtering
+Remove Search, Bookmarks, and Tools button up top
+Indexes all NTFS drives attached to system
+Not only saves the db it builds, but on program re-open it can load the previous db and update it with new changes
+Be able to sort low/high and/or A/Z with various
