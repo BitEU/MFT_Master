@@ -118,12 +118,12 @@ This repository includes a LICENSE file. See LICENSE for details.
 
 ## Todo
 
-No real-time updates (would need USN journal monitoring)
-Regex support
+Add real-time updates (would need USN journal monitoring)
+Add Regex support in search field
 Under edit button, add file Size and file date filtering
 Remove Search, Bookmarks, and Tools button up top
-Indexes all NTFS drives attached to system
-Not only saves the db it builds, but on program re-open it can load the previous db and update it with new changes
+Make program Indexe all NTFS drives attached to system
+Make program not only save the db it builds, but on program re-open it can load the previous db and update it with new changes
 Be able to sort low/high and/or A/Z with various
 Under file button, save results and their details to a CSV
 Under help button, add an about acknowledging inspiration regarding everything by voidtools and version information
